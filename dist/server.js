@@ -19,6 +19,50 @@ const authentication = new ConfigurationBotFrameworkAuthentication({
 });
 const adapter = new CloudAdapter(authentication);
 adapter.onTurnError = async (context, error) => { console.error(error); await context.sendActivity('The live-chat bridge encountered an error.'); };
+function replyKeys(activity) {
+    const channelData = activity.channelData ?? {};
+    const raw = [
+        activity.replyToId,
+        activity.conversation?.id,
+        channelData.replyToId,
+        channelData.messageId,
+        channelData.teamsMessageId,
+    ].filter((value) => typeof value === 'string' && value.length > 0);
+    const keys = new Set();
+    for (const value of raw) {
+        keys.add(value);
+        let decoded = value;
+        try {
+            decoded = decodeURIComponent(value);
+        }
+        catch { /* Keep the original value. */ }
+        keys.add(decoded);
+        for (const candidate of [value, decoded]) {
+            const match = candidate.match(/(?:messageid|messageId|replyToId)=([^;&]+)/i);
+            if (match?.[1]) {
+                keys.add(match[1]);
+                try {
+                    keys.add(decodeURIComponent(match[1]));
+                }
+                catch { /* Keep the captured value. */ }
+            }
+        }
+    }
+    return [...keys];
+}
+function sessionForReply(activity) {
+    const keys = replyKeys(activity);
+    for (const key of keys) {
+        const direct = store.rootToSession.get(key);
+        if (direct)
+            return direct;
+    }
+    for (const [rootId, sessionId] of store.rootToSession) {
+        if (keys.some((key) => key.includes(rootId)))
+            return sessionId;
+    }
+    return undefined;
+}
 function authorised(req, res, next) {
     const supplied = req.get('x-chat-key') ?? (typeof req.query.key === 'string' ? req.query.key : undefined);
     if (!process.env.CHAT_API_KEY || supplied !== process.env.CHAT_API_KEY)
@@ -36,10 +80,19 @@ app.post('/api/messages', (req, res) => {
             await context.sendActivity('Website live chat is connected to this channel.');
             return;
         }
-        const rootId = context.activity.replyToId;
-        const sessionId = rootId ? store.rootToSession.get(rootId) : undefined;
-        if (!sessionId)
+        const keys = replyKeys(context.activity);
+        const sessionId = sessionForReply(context.activity);
+        console.info('Teams reply lookup', JSON.stringify({
+            activityId: context.activity.id,
+            replyToId: context.activity.replyToId,
+            conversationId: context.activity.conversation?.id,
+            keys,
+            matched: Boolean(sessionId),
+        }));
+        if (!sessionId) {
+            await context.sendActivity('I received that message, but could not match it to a website chat thread. Please reply inside the thread created by the website visitor.');
             return;
+        }
         store.add(sessionId, 'agent', text);
     });
 });
@@ -65,7 +118,7 @@ app.post('/chat/:id/messages', authorised, async (req, res) => {
     await adapter.continueConversationAsync(process.env.MICROSOFT_APP_ID ?? '', store.channel, async (context) => {
         const activity = session.rootActivityId
             ? { type: 'message', text: `**${session.visitorName}:** ${parsed.data.text}`, replyToId: session.rootActivityId }
-            : { type: 'message', text: `**New website chat · ${session.id.slice(0, 8)}**\n\n**Visitor:** ${session.visitorName}\n\n**Page:** ${session.page}\n\n${parsed.data.text}` };
+            : { type: 'message', text: `**New website chat Â· ${session.id.slice(0, 8)}**\n\n**Visitor:** ${session.visitorName}\n\n**Page:** ${session.page}\n\n${parsed.data.text}` };
         const sent = await context.sendActivity(activity);
         if (!session.rootActivityId && sent?.id) {
             session.rootActivityId = sent.id;
