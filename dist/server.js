@@ -155,18 +155,25 @@ app.post('/api/messages', (req, res) => {
         const text = (context.activity.text ?? '')
             .replace(/<at>.*?<\/at>/g, '')
             .trim();
+if (text.toLowerCase() === 'setup') {
+    const channel = TurnContext.getConversationReference(context.activity);
 
-        if (text.toLowerCase() === 'setup') {
-            store.channel = TurnContext.getConversationReference(
-                context.activity
-            );
+    if (channel.conversation?.id) {
+        channel.conversation.id = channel.conversation.id.replace(
+            /;messageid=[^;]+/i,
+            ''
+        );
+    }
 
-            await context.sendActivity(
-                'Website live chat is connected to this channel.'
-            );
+    channel.activityId = undefined;
+    store.channel = channel;
 
-            return;
-        }
+    await context.sendActivity(
+        'Website live chat is connected to this channel.'
+    );
+
+    return;
+}
 
         const keys = replyKeys(context.activity);
         const sessionId = sessionForReply(context.activity);
