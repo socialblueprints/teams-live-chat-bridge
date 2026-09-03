@@ -16,7 +16,7 @@ const app = express();
 
 const origins = (process.env.ALLOWED_ORIGINS ?? '')
     .split(',')
-    .map((x) => x.trim())
+    .map((value) => value.trim())
     .filter(Boolean);
 
 app.use(helmet({ contentSecurityPolicy: false }));
@@ -26,10 +26,8 @@ app.use(express.json({ limit: '32kb' }));
 const authentication = new ConfigurationBotFrameworkAuthentication({
     MicrosoftAppId: process.env.MICROSOFT_APP_ID,
     MicrosoftAppPassword: process.env.MICROSOFT_APP_PASSWORD,
-    MicrosoftAppType:
-        process.env.MICROSOFT_APP_TYPE ?? 'SingleTenant',
-    MicrosoftAppTenantId:
-        process.env.MICROSOFT_APP_TENANT_ID,
+    MicrosoftAppType: process.env.MICROSOFT_APP_TYPE ?? 'SingleTenant',
+    MicrosoftAppTenantId: process.env.MICROSOFT_APP_TENANT_ID,
 });
 
 const adapter = new CloudAdapter(authentication);
@@ -40,6 +38,167 @@ adapter.onTurnError = async (context, error) => {
         'The live-chat bridge encountered an error.'
     );
 };
+
+/*
+ * Automatic Teams presence
+ */
+
+const presenceUserIds = (process.env.PRESENCE_USER_IDS ?? '')
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean);
+
+const presenceIntervalMs =
+    Math.max(30, Number(process.env.PRESENCE_CHECK_SECONDS ?? 60)) * 1000;
+
+const presenceOfflineDelayMs =
+    Math.max(
+        0,
+        Number(process.env.PRESENCE_OFFLINE_DELAY_MINUTES ?? 5)
+    ) * 60 * 1000;
+
+const activePresenceValues = new Set([
+    'Available',
+    'AvailableIdle',
+    'Busy',
+    'BusyIdle',
+    'DoNotDisturb',
+    'BeRightBack'
+]);
+
+let graphToken;
+let allUnavailableSince;
+
+async function getGraphToken() {
+    if (
+        graphToken &&
+        graphToken.expiresAt > Date.now() + 60000
+    ) {
+        return graphToken.value;
+    }
+
+    const tenantId = process.env.MICROSOFT_APP_TENANT_ID;
+    const clientId = process.env.MICROSOFT_APP_ID;
+    const clientSecret = process.env.MICROSOFT_APP_PASSWORD;
+
+    if (!tenantId || !clientId || !clientSecret) {
+        throw new Error(
+            'Microsoft Graph credentials are incomplete'
+        );
+    }
+
+    const body = new URLSearchParams({
+        client_id: clientId,
+        client_secret: clientSecret,
+        scope: 'https://graph.microsoft.com/.default',
+        grant_type: 'client_credentials'
+    });
+
+    const response = await fetch(
+        `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`,
+        {
+            method: 'POST',
+            headers: {
+                'content-type':
+                    'application/x-www-form-urlencoded'
+            },
+            body
+        }
+    );
+
+    if (!response.ok) {
+        throw new Error(
+            `Graph token request failed (${response.status}): ${await response.text()}`
+        );
+    }
+
+    const data = await response.json();
+
+    graphToken = {
+        value: data.access_token,
+        expiresAt: Date.now() + data.expires_in * 1000
+    };
+
+    return graphToken.value;
+}
+
+async function updatePresenceAvailability() {
+    if (
+        store.availabilityMode !== 'auto' ||
+        presenceUserIds.length === 0
+    ) {
+        return;
+    }
+
+    try {
+        const token = await getGraphToken();
+
+        const response = await fetch(
+            'https://graph.microsoft.com/v1.0/communications/getPresencesByUserId',
+            {
+                method: 'POST',
+                headers: {
+                    authorization: `Bearer ${token}`,
+                    'content-type': 'application/json'
+                },
+                body: JSON.stringify({
+                    ids: presenceUserIds
+                })
+            }
+        );
+
+        if (!response.ok) {
+            throw new Error(
+                `Graph presence request failed (${response.status}): ${await response.text()}`
+            );
+        }
+
+        const data = await response.json();
+
+        const staffOnline = (data.value ?? []).some(
+            (presence) =>
+                activePresenceValues.has(
+                    presence.availability ?? ''
+                )
+        );
+
+        if (staffOnline) {
+            allUnavailableSince = undefined;
+
+            if (!store.online) {
+                store.setOnline(true);
+            }
+        } else {
+            allUnavailableSince ??= Date.now();
+
+            if (
+                store.online &&
+                Date.now() - allUnavailableSince >=
+                    presenceOfflineDelayMs
+            ) {
+                store.setOnline(false);
+            }
+        }
+
+        console.info(
+            'Teams presence checked',
+            JSON.stringify({
+                staff: data.value,
+                online: store.online,
+                mode: store.availabilityMode
+            })
+        );
+    } catch (error) {
+        console.error(
+            'Teams presence check failed; preserving current availability',
+            error
+        );
+    }
+}
+
+/*
+ * Teams thread matching
+ */
 
 function expandIdentifiers(raw) {
     const values = raw.filter(
@@ -58,7 +217,7 @@ function expandIdentifiers(raw) {
         try {
             decoded = decodeURIComponent(value);
         } catch {
-            // Keep original.
+            // Keep original value.
         }
 
         keys.add(decoded);
@@ -72,7 +231,9 @@ function expandIdentifiers(raw) {
                 keys.add(match[1]);
 
                 try {
-                    keys.add(decodeURIComponent(match[1]));
+                    keys.add(
+                        decodeURIComponent(match[1])
+                    );
                 } catch {
                     // Keep captured value.
                 }
@@ -91,7 +252,7 @@ function replyKeys(activity) {
         activity.conversation?.id,
         data.replyToId,
         data.messageId,
-        data.teamsMessageId,
+        data.teamsMessageId
     ]);
 }
 
@@ -117,7 +278,9 @@ function sessionForReply(activity) {
     );
 
     if (unthreaded.length === 1) {
-        const rootId = keys.find((key) => /^\d+$/.test(key));
+        const rootId = keys.find((key) =>
+            /^\d+$/.test(key)
+        );
 
         if (rootId) {
             store.setRoot(unthreaded[0], rootId);
@@ -128,6 +291,10 @@ function sessionForReply(activity) {
     return undefined;
 }
 
+/*
+ * Website request security
+ */
+
 function authorised(req, res, next) {
     const supplied = req.get('x-chat-key');
 
@@ -136,7 +303,7 @@ function authorised(req, res, next) {
         supplied !== process.env.CHAT_API_KEY
     ) {
         return res.status(401).json({
-            error: 'Unauthorised',
+            error: 'Unauthorised'
         });
     }
 
@@ -164,19 +331,20 @@ function authorisedSession(req, res, next) {
 
     const supplied =
         req.get('x-chat-token') ??
-        (typeof req.query.token === 'string'
-            ? req.query.token
-            : '');
+        (
+            typeof req.query.token === 'string'
+                ? req.query.token
+                : ''
+        );
 
     const [expiryText, signature = ''] =
         supplied.split('.');
 
     const expiry = Number(expiryText);
 
-    const expected = makeSessionToken(
-        sessionId,
-        expiry
-    ).split('.')[1];
+    const expected =
+        makeSessionToken(sessionId, expiry)
+            .split('.')[1];
 
     const valid =
         Number.isFinite(expiry) &&
@@ -189,25 +357,33 @@ function authorisedSession(req, res, next) {
 
     if (!valid) {
         return res.status(401).json({
-            error: 'Chat session expired',
+            error: 'Chat session expired'
         });
     }
 
     next();
 }
 
+/*
+ * Public endpoints
+ */
+
 app.get('/health', (_req, res) => {
     res.json({
         ok: true,
-        teamsChannelConfigured: Boolean(store.channel),
+        teamsChannelConfigured: Boolean(store.channel)
     });
 });
 
 app.get('/availability', (_req, res) => {
     res.json({
-        online: store.online,
+        online: store.online
     });
 });
+
+/*
+ * Microsoft Teams bot endpoint
+ */
 
 app.post('/api/messages', (req, res) => {
     adapter.process(req, res, async (context) => {
@@ -228,9 +404,10 @@ app.post('/api/messages', (req, res) => {
 
         const command = text.toLowerCase();
 
-        const mentioned = (
-            context.activity.entities ?? []
-        ).some((entity) => entity.type === 'mention');
+        const mentioned =
+            (context.activity.entities ?? []).some(
+                (entity) => entity.type === 'mention'
+            );
 
         if (mentioned && command === 'setup') {
             const channel =
@@ -258,14 +435,45 @@ app.post('/api/messages', (req, res) => {
 
         if (
             mentioned &&
-            (command === 'online' || command === 'offline')
+            (
+                command === 'online' ||
+                command === 'offline'
+            )
         ) {
-            store.setOnline(command === 'online');
+            const online = command === 'online';
+
+            store.setAvailability(
+                online
+                    ? 'manual-online'
+                    : 'manual-offline',
+                online
+            );
 
             await context.sendActivity(
-                command === 'online'
-                    ? 'Website live chat is now online.'
-                    : 'Website live chat is now offline. Visitors can still leave a message.'
+                online
+                    ? 'Website live chat is now online. Automatic presence checking is paused.'
+                    : 'Website live chat is now offline. Visitors can still leave a message. Automatic presence checking is paused.'
+            );
+
+            return;
+        }
+
+        if (mentioned && command === 'auto') {
+            if (presenceUserIds.length === 0) {
+                await context.sendActivity(
+                    'Automatic availability has not been configured. Add PRESENCE_USER_IDS to the Azure Container App.'
+                );
+
+                return;
+            }
+
+            store.setAvailability('auto');
+            allUnavailableSince = undefined;
+
+            await updatePresenceAvailability();
+
+            await context.sendActivity(
+                `Automatic availability is enabled for ${presenceUserIds.length} staff account${presenceUserIds.length === 1 ? '' : 's'}.`
             );
 
             return;
@@ -273,9 +481,7 @@ app.post('/api/messages', (req, res) => {
 
         if (mentioned && command === 'status') {
             await context.sendActivity(
-                `Website live chat is currently **${
-                    store.online ? 'online' : 'offline'
-                }**.`
+                `Website live chat is currently **${store.online ? 'online' : 'offline'}**. Mode: **${store.availabilityMode}**.`
             );
 
             return;
@@ -291,7 +497,7 @@ app.post('/api/messages', (req, res) => {
                 conversationId:
                     context.activity.conversation?.id,
                 keys: replyKeys(context.activity),
-                matched: Boolean(sessionId),
+                matched: Boolean(sessionId)
             })
         );
 
@@ -305,10 +511,14 @@ app.post('/api/messages', (req, res) => {
     });
 });
 
+/*
+ * Website chat endpoints
+ */
+
 const startSchema = z.object({
     name: z.string().trim().min(1).max(80),
     email: z.string().email().max(254).optional(),
-    page: z.string().max(500).default(''),
+    page: z.string().max(500).default('')
 });
 
 app.post('/chat/start', authorised, (req, res) => {
@@ -316,7 +526,7 @@ app.post('/chat/start', authorised, (req, res) => {
 
     if (!parsed.success) {
         return res.status(400).json({
-            error: 'Invalid chat details',
+            error: 'Invalid chat details'
         });
     }
 
@@ -330,12 +540,12 @@ app.post('/chat/start', authorised, (req, res) => {
         id: session.id,
         token: makeSessionToken(session.id),
         online: store.online,
-        messages: session.messages,
+        messages: session.messages
     });
 });
 
 const messageSchema = z.object({
-    text: z.string().trim().min(1).max(2000),
+    text: z.string().trim().min(1).max(2000)
 });
 
 app.post(
@@ -346,23 +556,25 @@ app.post(
             String(req.params.id)
         );
 
-        const parsed = messageSchema.safeParse(req.body);
+        const parsed =
+            messageSchema.safeParse(req.body);
 
         if (!session) {
             return res.status(404).json({
-                error: 'Chat not found',
+                error: 'Chat not found'
             });
         }
 
         if (!parsed.success) {
             return res.status(400).json({
-                error: 'Invalid message',
+                error: 'Invalid message'
             });
         }
 
         if (!store.channel) {
             return res.status(503).json({
-                error: 'Teams channel has not been configured.',
+                error:
+                    'Teams channel has not been configured.'
             });
         }
 
@@ -372,7 +584,8 @@ app.post(
             parsed.data.text
         );
 
-        const target = structuredClone(store.channel);
+        const target =
+            structuredClone(store.channel);
 
         if (
             session.rootActivityId &&
@@ -380,46 +593,34 @@ app.post(
             !/;messageid=/i.test(target.conversation.id)
         ) {
             target.conversation.id =
-                `${target.conversation.id};messageid=` +
-                session.rootActivityId;
+                `${target.conversation.id};messageid=${session.rootActivityId}`;
         }
 
         await adapter.continueConversationAsync(
             process.env.MICROSOFT_APP_ID ?? '',
             target,
             async (context) => {
-                const details = session.visitorEmail
-                    ? `\n\n**Email:** ${session.visitorEmail}`
-                    : '';
+                const details =
+                    session.visitorEmail
+                        ? `\n\n**Email:** ${session.visitorEmail}`
+                        : '';
 
-                const activity = session.rootActivityId
-                    ? {
-                          type: 'message',
-                          text:
-                              `**${session.visitorName}:** ` +
-                              parsed.data.text,
-                          replyToId:
-                              session.rootActivityId,
-                      }
-                    : {
-                          type: 'message',
-                          text:
-                              `**New ${
-                                  store.online
-                                      ? 'website chat'
-                                      : 'offline enquiry'
-                              } · ${session.id.slice(
-                                  0,
-                                  8
-                              )}**\n\n` +
-                              `**Visitor:** ${
-                                  session.visitorName
-                              }${details}\n\n` +
-                              `**Page:** ${
-                                  session.page
-                              }\n\n` +
-                              parsed.data.text,
-                      };
+                const activity =
+                    session.rootActivityId
+                        ? {
+                            type: 'message',
+                            text: `**${session.visitorName}:** ${parsed.data.text}`,
+                            replyToId:
+                                session.rootActivityId
+                        }
+                        : {
+                            type: 'message',
+                            text:
+                                `**New ${store.online ? 'website chat' : 'offline enquiry'} · ${session.id.slice(0, 8)}**\n\n` +
+                                `**Visitor:** ${session.visitorName}${details}\n\n` +
+                                `**Page:** ${session.page}\n\n` +
+                                parsed.data.text
+                        };
 
                 const sent =
                     await context.sendActivity(activity);
@@ -446,7 +647,7 @@ app.post(
                         'Teams root sent',
                         JSON.stringify({
                             sentId: sent.id,
-                            keys,
+                            keys
                         })
                     );
                 }
@@ -467,13 +668,13 @@ app.get(
 
         if (!session) {
             return res.status(404).json({
-                error: 'Chat not found',
+                error: 'Chat not found'
             });
         }
 
         res.json({
             messages: session.messages,
-            online: store.online,
+            online: store.online
         });
     }
 );
@@ -483,7 +684,8 @@ app.get(
     authorisedSession,
     (req, res) => {
         const sessionId = String(req.params.id);
-        const session = store.sessions.get(sessionId);
+        const session =
+            store.sessions.get(sessionId);
 
         if (!session) {
             return res.status(404).end();
@@ -499,9 +701,12 @@ app.get(
             'no-cache, no-transform'
         );
 
-        res.setHeader('Connection', 'keep-alive');
-        res.flushHeaders();
+        res.setHeader(
+            'Connection',
+            'keep-alive'
+        );
 
+        res.flushHeaders();
         res.write(': connected\n\n');
 
         session.messages.forEach((message) => {
@@ -530,13 +735,22 @@ app.get(
     }
 );
 
+/*
+ * Start automatic presence polling
+ */
+
+setInterval(
+    () => void updatePresenceAvailability(),
+    presenceIntervalMs
+);
+
+void updatePresenceAvailability();
+
 app.listen(
     Number(process.env.PORT ?? 3978),
     () => {
         console.log(
-            `Teams live-chat bridge listening on ${
-                process.env.PORT ?? 3978
-            }`
+            `Teams live-chat bridge listening on ${process.env.PORT ?? 3978}`
         );
     }
 );
