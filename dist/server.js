@@ -248,16 +248,27 @@ app.post('/chat/:id/messages', authorised, async (req, res) => {
         });
     }
 
-    const visitorMessage = store.add(
-        session.id,
-        'visitor',
-        parsed.data.text
-    );
+const visitorMessage = store.add(
+    session.id,
+    'visitor',
+    parsed.data.text
+);
 
-    await adapter.continueConversationAsync(
-        process.env.MICROSOFT_APP_ID ?? '',
-        store.channel,
-        async (context) => {
+const target = structuredClone(store.channel);
+
+if (
+    session.rootActivityId &&
+    target.conversation?.id &&
+    !/;messageid=/i.test(target.conversation.id)
+) {
+    target.conversation.id =
+        `${target.conversation.id};messageid=${session.rootActivityId}`;
+}
+
+await adapter.continueConversationAsync(
+    process.env.MICROSOFT_APP_ID ?? '',
+    target,
+    async (context) => {
             const activity = session.rootActivityId
                 ? {
                       type: 'message',
