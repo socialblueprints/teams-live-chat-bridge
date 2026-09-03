@@ -5,6 +5,7 @@ export class PersistentStore {
     file = process.env.STATE_FILE ?? './data/state.json';
     _channel;
     online = true;
+    availabilityMode = 'manual-online';
     sessions = new Map();
     rootToSession = new Map();
     listeners = new Map();
@@ -24,32 +25,24 @@ export class PersistentStore {
 
     load() {
         try {
-            if (!existsSync(this.file)) {
+            if (!existsSync(this.file))
                 return;
-            }
 
-            const state = JSON.parse(
-                readFileSync(this.file, 'utf8')
-            );
-
+            const state = JSON.parse(readFileSync(this.file, 'utf8'));
             this._channel = state.channel;
             this.online = state.online ?? true;
+            this.availabilityMode =
+                state.availabilityMode ??
+                (this.online ? 'manual-online' : 'manual-offline');
 
             this.sessions = new Map(
-                (state.sessions ?? []).map((session) => [
-                    session.id,
-                    session,
-                ])
+                (state.sessions ?? []).map((session) => [session.id, session])
             );
 
-            this.rootToSession = new Map(
-                state.rootToSession ?? []
-            );
-        } catch (error) {
-            console.error(
-                'Could not load persistent chat state',
-                error
-            );
+            this.rootToSession = new Map(state.rootToSession ?? []);
+        }
+        catch (error) {
+            console.error('Could not load persistent chat state', error);
         }
     }
 
@@ -62,20 +55,22 @@ export class PersistentStore {
         const state = {
             channel: this._channel,
             online: this.online,
+            availabilityMode: this.availabilityMode,
             sessions: [...this.sessions.values()],
             rootToSession: [...this.rootToSession.entries()],
         };
 
-        writeFileSync(
-            temporary,
-            JSON.stringify(state),
-            { mode: 0o600 }
-        );
-
+        writeFileSync(temporary, JSON.stringify(state), { mode: 0o600 });
         renameSync(temporary, this.file);
     }
 
     setOnline(online) {
+        this.online = online;
+        this.persist();
+    }
+
+    setAvailability(mode, online = this.online) {
+        this.availabilityMode = mode;
         this.online = online;
         this.persist();
     }
@@ -113,9 +108,8 @@ export class PersistentStore {
     add(sessionId, sender, text) {
         const session = this.sessions.get(sessionId);
 
-        if (!session) {
+        if (!session)
             throw new Error('Chat session not found');
-        }
 
         const message = {
             id: crypto.randomUUID(),
@@ -136,12 +130,11 @@ export class PersistentStore {
     }
 
     subscribe(sessionId, listener) {
-        const listeners =
-            this.listeners.get(sessionId) ?? new Set();
+        const set = this.listeners.get(sessionId) ?? new Set();
 
-        listeners.add(listener);
-        this.listeners.set(sessionId, listeners);
+        set.add(listener);
+        this.listeners.set(sessionId, set);
 
-        return () => listeners.delete(listener);
+        return () => set.delete(listener);
     }
 }
